@@ -1,0 +1,358 @@
+#extracting data
+
+import os
+from scipy.io import loadmat
+from scp import SCPClient
+import numpy as np
+import random
+import csv
+
+csv_file_path = "a-large-scale-12-lead-electrocardiogram-database-for-arrhythmia-study-1.0.0/ConditionNames_SNOMED-CT.csv"
+
+# extract values from column 1
+target_column_index = 2
+
+# list to store diseases
+values_from_third_column = [270492004]
+
+# Open the CSV file and read its contents
+with open(csv_file_path, 'r') as file:
+    # Create a CSV reader object
+    csv_reader = csv.reader(file)
+
+    # Iterate through each row in the CSV file
+    for i, row in enumerate(csv_reader):
+        # Skip the first row
+        if i == 0:
+            continue
+        
+        # Check if the row has enough columns
+        if len(row) > target_column_index:
+            # Extract the value from the specified column and append it to the list
+            values_from_third_column.append(int(row[target_column_index]))
+
+baseFolder = "a-large-scale-12-lead-electrocardiogram-database-for-arrhythmia-study-1.0.0/WFDBRecords"
+conditions = values_from_third_column
+conditions = np.array(conditions[1:])
+print(conditions)
+print(len(conditions))
+labels_list = []
+file_number_list = [i for i in range(45551)]
+random.shuffle(file_number_list)
+
+
+def createTargetVec(cases, conditions):
+    target = np.zeros(len(conditions))
+    for i in cases[0]:
+        #print(i)
+        #print(np.argwhere(int(i)==conditions))
+        target[np.argwhere(int(i)==conditions)] = 1
+    return target
+
+def loadEEGData(baseFolder, conditions, numFiles,n):
+    
+    Data = np.zeros((numFiles, 60000))
+    targets = np.zeros((numFiles,len(conditions)))
+    
+    for i in range(n*numFiles,numFiles*(n+1)):
+        if i == 45551:
+            break
+        if i%1000 == 0 :
+            print(i)
+        if i == 100:
+            print(i)
+        fileNum = str(file_number_list[i]).zfill(5)
+        matFilename = "JS" + str(fileNum) + ".mat"
+        heaFilename = "JS" + str(fileNum) + ".hea"
+        #print(matFilename)
+        for root, dirs, files in os.walk(baseFolder):
+            if matFilename in files:
+                matFile_path = os.path.join(root, matFilename)
+                heaFile_path = os.path.join(root, heaFilename)
+                matContent = loadmat(matFile_path)
+                matContent = matContent['val']
+                
+                Data[i-1-n*numFiles,:,] = np.ndarray.flatten(matContent)
+                
+                diagnosis = []  # Use a list to store multiple diagnoses
+                with open(heaFile_path, 'r') as file:
+                    for line in file:
+                        if line.startswith('#Dx'):
+                        # Append each diagnosis to the list
+                            diagnosis.append((line[len('#Dx:'):].strip().split(',')))
+                
+
+                
+                diagnosis_array = np.array(diagnosis)
+                
+                                 
+        
+                targets[i-1-n*numFiles,:] = createTargetVec(diagnosis,conditions)
+                    
+    #dont count files with faults
+    faultyFiles = []
+    for i in range(0,numFiles):
+        if sum(targets[i,:])==0:
+            
+            faultyFiles.append(i)
+    
+    
+    Data = np.delete(Data,faultyFiles, axis=0)
+    targets = np.delete(targets,faultyFiles, axis=0)      
+            
+            
+    return Data, targets
+
+#Data, labels = loadEEGData(baseFolder, conditions, numFiles)
+#print(np.shape(Data))
+#print(np.shape(labels))
+
+#creating model, training and validation. 
+
+from torch import tensor
+from torchmetrics.detection import MeanAveragePrecision
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, random_split
+from sklearn.metrics import average_precision_score
+import matplotlib.pyplot as plt
+from torchmetrics.detection import MeanAveragePrecision
+
+class MultilabelClassificationModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes, threshold_values):
+        super(MultilabelClassificationModel, self).__init__()
+        self.flatten = nn.Flatten()
+        self.hidden_layer = nn.Linear(input_size, hidden_size)
+        self.relu = nn.ReLU()
+        self.output_layer = nn.Linear(hidden_size, num_classes)
+        self.sigmoid = nn.Sigmoid()
+        self.threshold_values = nn.Parameter(threshold_values)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        x = self.hidden_layer(x)
+        x = self.relu(x)
+        x = self.output_layer(x)
+        x = self.sigmoid(x)
+        return x
+    
+    def apply_threshold(self, output):
+        return (output > self.threshold_values).float()
+
+def apply_threshold2(threshold_values, output):
+    return (output > threshold_values).float()   
+
+input_size = 10000
+hidden_size = 4096
+num_classes = 63
+
+# Threshold values for one-hot encoding 
+threshold_values = torch.tensor([0.5] * num_classes, requires_grad=True)
+
+model = MultilabelClassificationModel(input_size, hidden_size, num_classes, threshold_values)
+device = torch.device("cuda:1")
+model = model.to(device)   
+
+
+epochs = 40
+Loss = []
+mAP_values = []
+#print(labels)
+
+
+mAP_epoch = []
+loss_epoch = []
+mAP_con_epoch = []
+
+sum_conditions = np.zeros((1,63))
+
+numFiles = 10000
+file_number_list = [i for i in range(45551)]
+random.shuffle(file_number_list)
+
+for offset in range(4):
+    
+    Data, labels = loadEEGData(baseFolder, conditions, numFiles,offset)
+    sum_conditions += np.sum(labels, axis=0)
+    # Generate random input data
+    input_data = Data[:,0:input_size]
+
+    # Generate random one-hot encoded labels (10 samples, each of shape (63,))
+    labels = labels
+
+    print(np.shape(input_data))
+    print(np.shape(labels))
+
+    # Normalizing the input data
+    input_data = input_data / np.max(input_data)
+
+    # Converting arrays to tensors
+    input_data_tensor = torch.tensor(input_data, dtype=torch.float32)
+    labels_tensor = torch.tensor(labels, dtype=torch.float32)
+
+    # Create a DataLoader for training
+    dataset = TensorDataset(input_data_tensor, labels_tensor)
+
+
+
+    total_size = len(input_data[:,0])
+    train_size = int(0.85 * total_size)
+    val_size = total_size-train_size
+    #test_size = total_size - train_size - val_size
+
+    # creating datasets for training and validation
+   
+    
+    train_dataset, val_dataset = random_split(
+        dataset, [train_size, val_size]
+    )
+
+    # Dataloader for training and validation
+    batch_size = 16
+    train_dataloader = DataLoader(train_dataset, batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size, shuffle=False)
+    
+        
+    #test_dataloader = DataLoader(test_dataset, batch_size, shuffle=False)
+
+
+    # loss and optimizer
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Training loop
+    
+    
+    for epoch in range(epochs):
+
+
+        print(epoch)
+        for inputs, targets in train_dataloader:
+            #print(torch.cuda.mem_get_info(device))
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            #predictions = model.apply_threshold(outputs)
+            #print((targets[0].numpy()))
+            # Calculate mean average precision
+
+            loss = criterion(outputs, targets)
+            loss.backward()
+            Loss.append(loss.item())
+            optimizer.step()
+            torch.cuda.empty_cache()
+            #print(torch.cuda.mem_get_info(device))
+        model.eval()
+        val_mAP = 0
+        val_con_mAP = 0
+        val_loss = 0
+
+        with torch.no_grad():
+            for inputs, targets in val_dataloader:
+
+                inputs, targets,threshold_values = inputs.to(device), targets.to(device), threshold_values.to(device)
+                outputs = model(inputs)
+                predictions = (outputs > threshold_values).float()
+
+                val_loss += criterion(predictions, targets).item()
+                idx = []
+                for i in range(len(targets)): 
+
+                    idx = np.where(targets[i].cpu().numpy()==1)
+                    idx2 = np.where(predictions[i].cpu().numpy()==1)
+
+                    val_mAP += average_precision_score(targets[i].cpu().numpy(), predictions[i].cpu().detach().numpy(), average='macro') 
+                    val_con_mAP += average_precision_score(targets[i].cpu().numpy(), outputs[i].cpu().detach().numpy(), average='macro')
+                    
+                    #print(validation_mAP)
+                    for j in idx:
+                        if not torch.equal(targets[i][j], predictions[i][j]):
+                            #print(j)
+                            threshold_values[j] *= 0.999
+
+                    for g in idx2:
+                        if not torch.equal(targets[i][g], predictions[i][g]):
+                            #print(j)
+                            threshold_values[g] *= 1.001
+
+
+
+        av_mAP =  val_mAP/val_size
+        av_loss = val_loss/val_size
+        av_mAP_con = val_con_mAP/val_size
+        loss_epoch.append(av_loss)
+        mAP_epoch.append(av_mAP)
+        mAP_con_epoch.append(av_mAP_con)
+
+        #print(av_mAP)
+
+
+# plotting loss, mAP discrete and continous
+plt.plot(loss_epoch)
+plt.xlabel('Iteration')
+plt.ylabel('Loss')
+plt.show()
+
+plt.plot(mAP_epoch)
+plt.xlabel('Epoch')
+plt.ylabel('Mean Average Precision on discrete predictions (mAP)')
+plt.show()
+
+plt.plot(mAP_con_epoch)
+plt.xlabel('Epoch')
+plt.ylabel('Mean Average Precision on continous outputs (mAP)')
+plt.show()
+
+
+
+print(sum_conditions)
+
+#testing the model on unseen data
+
+numFiles = 10000
+Data, labels = loadEEGData(baseFolder, conditions, numFiles,4)
+    
+# Generate random input data 
+input_data = Data[:,0:input_size]
+
+# Generate random one-hot encoded labels
+labels = labels
+
+print(np.shape(input_data))
+print(np.shape(labels))
+
+# Normalizing the input data
+input_data = input_data / np.max(input_data)
+
+
+# Converting arrays to tensors
+input_data_tensor = torch.tensor(input_data, dtype=torch.float32)
+labels_tensor = torch.tensor(labels, dtype=torch.float32)
+
+# Dataloader for training
+dataset = TensorDataset(input_data_tensor, labels_tensor)
+
+batch_size = 64
+test_dataloader = DataLoader(dataset, batch_size, shuffle=True)
+test_loss = 0
+test_mAP = 0
+
+with torch.no_grad():
+    
+    for inputs, targets in test_dataloader:
+        
+        inputs, targets,threshold_values = inputs.to(device), targets.to(device), threshold_values.to(device)
+        outputs = model(inputs)
+        predictions = (outputs > threshold_values).float()
+
+        test_loss += criterion(predictions, targets).item()
+        idx = []
+        for i in range(len(targets)): 
+
+            test_mAP += average_precision_score(targets[i].cpu().numpy(), predictions[i].cpu().detach().numpy(), average='macro') 
+            #print(validation_mAP)
+    test_av_mAP =  test_mAP/len(input_data)
+    test_losses = test_loss/len(input_data)
